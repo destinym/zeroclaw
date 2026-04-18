@@ -1386,6 +1386,21 @@ fn parse_responses_response_body(
     })
 }
 
+fn is_provider_acceptable_image_url(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower_prefix: String = trimmed
+        .chars()
+        .take(8)
+        .flat_map(char::to_lowercase)
+        .collect();
+    lower_prefix.starts_with("data:")
+        || lower_prefix.starts_with("http://")
+        || lower_prefix.starts_with("https://")
+}
+
 impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
@@ -1481,9 +1496,22 @@ impl OpenAiCompatibleProvider {
         }
 
         for image_ref in image_refs {
-            parts.push(MessagePart::ImageUrl {
-                image_url: ImageUrlPart { url: image_ref },
-            });
+            // Only `data:` URIs and absolute http(s) URLs are accepted by
+            // OpenAI-compatible providers in `image_url.url`.  Local
+            // filesystem paths must already have been base64-encoded by
+            // `multimodal::prepare_messages_for_provider` upstream.  If a
+            // path slips through (multimodal disabled, agent loop bypassed,
+            // serialization race), drop it to text rather than sending an
+            // invalid URL that the provider will reject with HTTP 400.
+            if is_provider_acceptable_image_url(&image_ref) {
+                parts.push(MessagePart::ImageUrl {
+                    image_url: ImageUrlPart { url: image_ref },
+                });
+            } else {
+                tracing::warn!(
+                    "OpenAI-compatible provider: dropping unencoded image marker (not a data: URI or http(s) URL): {image_ref:?}"
+                );
+            }
         }
 
         MessageContent::Parts(parts)
@@ -4274,5 +4302,52 @@ mod tests {
     #[test]
     fn proxy_tool_event_done_sentinel_returns_none() {
         assert!(parse_proxy_tool_event("data: [DONE]").is_none());
+    }
+
+    #[test]
+    fn acceptable_image_url_accepts_data_uri() {
+        assert!(is_provider_acceptable_image_url(
+            "data:image/png;base64,AAAA"
+        ));
+        assert!(is_provider_acceptable_image_url(
+            "DATA:image/jpeg;base64,xyz"
+        ));
+    }
+
+    #[test]
+    fn acceptable_image_url_accepts_http_and_https() {
+        assert!(is_provider_acceptable_image_url("http://example.com/x.png"));
+        assert!(is_provider_acceptable_image_url(
+            "https://example.com/x.png"
+        ));
+        assert!(is_provider_acceptable_image_url(
+            "HTTPS://EXAMPLE.COM/x.png"
+        ));
+    }
+
+    #[test]
+    fn acceptable_image_url_rejects_windows_path() {
+        assert!(!is_provider_acceptable_image_url(
+            r"E:\Tools\AITools\zeroclaw\workspace\sessions\files\img.webp"
+        ));
+        assert!(!is_provider_acceptable_image_url(
+            r"\\?\E:\Tools\AITools\zeroclaw\workspace\sessions\oc_xxx\files\img.webp"
+        ));
+    }
+
+    #[test]
+    fn acceptable_image_url_rejects_unix_path() {
+        assert!(!is_provider_acceptable_image_url("/home/user/img.png"));
+        assert!(!is_provider_acceptable_image_url("./relative.png"));
+    }
+
+    #[test]
+    fn acceptable_image_url_rejects_empty_and_plain_text() {
+        assert!(!is_provider_acceptable_image_url(""));
+        assert!(!is_provider_acceptable_image_url("   "));
+        assert!(!is_provider_acceptable_image_url(
+            "img_v3_0210s_xxx | download failed"
+        ));
+        assert!(!is_provider_acceptable_image_url("ftp://example.com/x.png"));
     }
 }
