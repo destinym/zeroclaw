@@ -157,9 +157,25 @@ pub async fn prepare_messages_for_provider(
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+            match normalize_image_reference(&reference, config, max_bytes, &remote_client).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(error) => {
+                    // Drop "broken marker" errors (missing file, malformed
+                    // marker, IO/network failure) so a single stale entry in
+                    // session memory — e.g. the historical
+                    // `[IMAGE:<key> | download failed]` text fallback — does
+                    // not abort the whole LLM call.  Policy errors
+                    // (size/MIME/remote-fetch-disabled) still propagate so
+                    // misconfiguration surfaces loudly.
+                    if is_broken_marker_error(&error) {
+                        tracing::warn!(
+                            "multimodal: dropping bad image marker {reference:?}: {error}"
+                        );
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
         }
 
         let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
@@ -364,6 +380,21 @@ async fn normalize_remote_image(
     validate_mime(source, &mime)?;
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+/// True for errors that mean "this specific marker is unusable" rather than
+/// "the user's request is invalid".  Broken markers are dropped so the rest
+/// of the conversation can still reach the LLM; policy errors propagate.
+fn is_broken_marker_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<MultimodalError>(),
+        Some(
+            MultimodalError::ImageSourceNotFound { .. }
+                | MultimodalError::InvalidMarker { .. }
+                | MultimodalError::LocalReadFailed { .. }
+                | MultimodalError::RemoteFetchFailed { .. }
+        )
+    )
 }
 
 /// Strip the Windows verbatim/extended-length prefix `\\?\` (or `\\?\UNC\`)
@@ -591,6 +622,28 @@ mod tests {
         assert_eq!(cleaned, "Please inspect this screenshot");
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_drops_unresolvable_marker_and_keeps_text() {
+        // Stale session memory may carry markers like the historical
+        // `[IMAGE:<key> | download failed]` fallback, or paths to files that
+        // have since been moved.  These must not abort the whole LLM call.
+        let messages = vec![ChatMessage::user(
+            "Please look at [IMAGE:/nonexistent/path/to/img.png] this".to_string(),
+        )];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("must not propagate per-image error");
+
+        assert_eq!(prepared.messages.len(), 1);
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert_eq!(cleaned, "Please look at  this");
+        assert!(
+            refs.is_empty(),
+            "bad marker should be dropped, got {refs:?}"
+        );
     }
 
     #[tokio::test]
