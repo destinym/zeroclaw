@@ -259,6 +259,24 @@ fn filename_for_image(image_key: &str, mime: &str) -> String {
     format!("{image_key}.{}", extension_for_image_mime(mime))
 }
 
+/// Strip the Windows verbatim/extended-length prefix `\\?\` from a path so it
+/// can be passed to consumers that don't understand it (LLM providers, tools
+/// that URL-encode the path, etc.).  No-op on non-Windows or paths without
+/// the prefix.
+fn strip_extended_length_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// Strip a path segment to filename-safe characters, refusing traversal
 /// attempts.  Returns `None` if the segment is empty or reserved (`.`/`..`).
 fn sanitize_path_segment(input: &str) -> Option<String> {
@@ -596,8 +614,8 @@ impl LarkChannel {
     }
 
     /// Set the workspace root used to persist downloaded images/files under
-    /// `{workspace_dir}/sessions/{chat_id}/files/`.  When unset, images are
-    /// inlined as base64 markers (legacy fallback).
+    /// `{workspace_dir}/sessions/files/`.  When unset, images are inlined as
+    /// base64 markers (legacy fallback).
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
         self
@@ -1104,11 +1122,7 @@ impl LarkChannel {
                                 None => { tracing::debug!("Lark WS: image message missing image_key"); continue; }
                             };
                             match self
-                                .download_image_as_marker(
-                                    &lark_msg.message_id,
-                                    &lark_msg.chat_id,
-                                    &image_key,
-                                )
+                                .download_image_as_marker(&lark_msg.message_id, &image_key)
                                 .await
                             {
                                 Some(marker) => (marker, Vec::new()),
@@ -1281,15 +1295,10 @@ impl LarkChannel {
     /// `[IMAGE:...]` marker the multimodal pipeline can consume.
     ///
     /// When `workspace_dir` is configured, the image is persisted to
-    /// `{workspace_dir}/sessions/{chat_id}/files/<image_key>.<ext>` and the
-    /// marker carries the absolute file path so downstream tools can re-open
-    /// the file.  Otherwise we fall back to an inline `data:` URI.
-    async fn download_image_as_marker(
-        &self,
-        message_id: &str,
-        chat_id: &str,
-        image_key: &str,
-    ) -> Option<String> {
+    /// `{workspace_dir}/sessions/files/<image_key>.<ext>` and the marker
+    /// carries the absolute file path so downstream tools can re-open the
+    /// file.  Otherwise we fall back to an inline `data:` URI.
+    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
@@ -1363,7 +1372,6 @@ impl LarkChannel {
         if let Some(workspace) = self.workspace_dir.as_ref() {
             match Self::persist_session_file(
                 workspace,
-                chat_id,
                 &filename_for_image(image_key, &mime),
                 &bytes,
             )
@@ -1383,17 +1391,16 @@ impl LarkChannel {
         Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
     }
 
-    /// Write `bytes` to `{workspace}/sessions/{chat_id}/files/{file_name}`,
-    /// rejecting any path that would escape the workspace root.  Returns the
-    /// canonical path of the written file.
+    /// Write `bytes` to `{workspace}/sessions/files/{file_name}`, rejecting any
+    /// path that would escape the workspace root.  Returns the resolved path
+    /// of the written file with any Windows `\\?\` extended-length prefix
+    /// stripped — downstream consumers (LLM providers, tools) reject paths
+    /// that include the verbatim prefix.
     async fn persist_session_file(
         workspace: &std::path::Path,
-        chat_id: &str,
         file_name: &str,
         bytes: &[u8],
     ) -> anyhow::Result<PathBuf> {
-        let safe_session = sanitize_path_segment(chat_id)
-            .ok_or_else(|| anyhow::anyhow!("invalid chat_id for session dir: {chat_id}"))?;
         let safe_file = sanitize_path_segment(file_name)
             .ok_or_else(|| anyhow::anyhow!("invalid filename: {file_name}"))?;
 
@@ -1402,7 +1409,7 @@ impl LarkChannel {
             .await
             .unwrap_or_else(|_| workspace.to_path_buf());
 
-        let session_files_dir = workspace.join("sessions").join(&safe_session).join("files");
+        let session_files_dir = workspace.join("sessions").join("files");
         tokio::fs::create_dir_all(&session_files_dir).await?;
         let resolved_dir = tokio::fs::canonicalize(&session_files_dir).await?;
         if !resolved_dir.starts_with(&workspace_root) {
@@ -1414,7 +1421,7 @@ impl LarkChannel {
 
         let target = resolved_dir.join(safe_file);
         tokio::fs::write(&target, bytes).await?;
-        Ok(target)
+        Ok(strip_extended_length_prefix(target))
     }
 
     /// Download a file from the Lark API and return a text content marker.
@@ -1917,9 +1924,7 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self
-                            .download_image_as_marker(evt_message_id, evt_chat_id, &key)
-                            .await
+                        let marker = match self.download_image_as_marker(evt_message_id, &key).await
                         {
                             Some(m) => m,
                             None => {
@@ -4466,18 +4471,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
 
-        let path = LarkChannel::persist_session_file(
-            &workspace,
-            "oc_chat_xyz",
-            "img_v3_abc.png",
-            b"fake-png-bytes",
-        )
-        .await
-        .expect("persist must succeed");
+        let path =
+            LarkChannel::persist_session_file(&workspace, "img_v3_abc.png", b"fake-png-bytes")
+                .await
+                .expect("persist must succeed");
 
-        // File lives under {workspace}/sessions/{chat_id}/files/{name}.
         let expected_suffix = std::path::Path::new("sessions")
-            .join("oc_chat_xyz")
             .join("files")
             .join("img_v3_abc.png");
         assert!(
@@ -4489,12 +4488,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_session_file_rejects_traversal_in_chat_id() {
+    async fn persist_session_file_rejects_invalid_filename() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
 
-        // ".." gets rejected by sanitize_path_segment up front.
-        let err = LarkChannel::persist_session_file(&workspace, "..", "x.png", b"x").await;
-        assert!(err.is_err(), "must reject traversal session id");
+        let err = LarkChannel::persist_session_file(&workspace, "..", b"x").await;
+        assert!(err.is_err(), "must reject reserved filename");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn persist_session_file_strips_extended_length_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        let path = LarkChannel::persist_session_file(&workspace, "x.png", b"x")
+            .await
+            .expect("persist must succeed");
+
+        let s = path.to_string_lossy();
+        assert!(
+            !s.starts_with(r"\\?\"),
+            "path {s:?} still has \\\\?\\ prefix"
+        );
     }
 }
