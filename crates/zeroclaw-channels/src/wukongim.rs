@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -74,14 +75,27 @@ pub struct ConnectParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendParams {
-    pub header: Header,
+    #[serde(rename = "fromUid", skip_serializing_if = "Option::is_none")]
+    pub from_uid: Option<String>,
     #[serde(rename = "clientMsgNo")]
     pub client_msg_no: String,
     #[serde(rename = "channelId")]
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: serde_json::Value, // JSON object per the WuKongIM spec
+    pub payload: String, // Base64 encoded payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<Header>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setting: Option<u32>,
+    #[serde(rename = "msgKey", skip_serializing_if = "Option::is_none")]
+    pub msg_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire: Option<u32>,
+    #[serde(rename = "streamNo", skip_serializing_if = "Option::is_none")]
+    pub stream_no: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,7 +110,7 @@ pub struct RecvNotificationParams {
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: serde_json::Value,
+    pub payload: String, // Received as Base64 string
     pub timestamp: i64,
 }
 
@@ -168,16 +182,25 @@ impl WuKongIMChannel {
         {
             let mut sink_guard = self.ws_sink.write().await;
             if let Some(ref mut sink) = *sink_guard {
+                tracing::info!("WuKongIM: sending RPC {} (id {}): {}", method, id, msg);
                 sink.send(WsMsg::Text(msg.into())).await?;
             } else {
                 anyhow::bail!("WuKongIM: WebSocket not connected");
             }
         }
 
-        let resp_val = tokio::time::timeout(Duration::from_secs(10), rx).await??;
+        let resp_val = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(result) => result?,
+            Err(e) => {
+                let mut pending = self.pending_responses.write().await;
+                pending.remove(&id);
+                anyhow::bail!("WuKongIM RPC timeout ({}): {}", method, e);
+            }
+        };
         let resp: JsonRpcResponse<R> = serde_json::from_value(resp_val)?;
 
         if let Some(err) = resp.error {
+            tracing::error!("WuKongIM RPC error ({}): {} (code {})", method, err.message, err.code);
             anyhow::bail!("WuKongIM RPC error: {} (code {})", err.message, err.code);
         }
 
@@ -185,11 +208,9 @@ impl WuKongIMChannel {
     }
 
     async fn send_ack(&self, message_id: String, message_seq: u32) -> anyhow::Result<()> {
-        let id = Uuid::new_v4().to_string();
-        let req = JsonRpcRequest {
+        let req = JsonRpcNotification {
             jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
             method: "recvack".to_string(),
-            id,
             params: RecvAckParams {
                 message_id,
                 message_seq,
@@ -259,17 +280,37 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let payload = serde_json::json!({
+        tracing::debug!("WuKongIM: sending message to {}: {}", message.recipient, message.content);
+        let payload_obj = serde_json::json!({
             "type": 1,
             "content": message.content,
         });
 
+        let payload_json = serde_json::to_string(&payload_obj)?;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload_json);
+
+        // Parse channel_type from recipient if formatted as "type:id"
+        let (channel_id, channel_type) = if let Some(pos) = message.recipient.find(':') {
+            let (t_str, id_str) = message.recipient.split_at(pos);
+            let id_str = &id_str[1..]; // skip the colon
+            let t = t_str.parse::<u8>().unwrap_or(1);
+            (id_str.to_string(), t)
+        } else {
+            (message.recipient.clone(), 1)
+        };
+
         let params = SendParams {
-            header: Header::default(),
+            from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
-            channel_id: message.recipient.clone(),
-            channel_type: 1, // 1: personal, 2: group
-            payload,
+            channel_id,
+            channel_type,
+            payload: payload_b64,
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
         };
 
         let _: serde_json::Value = self.send_rpc("send", params).await?;
@@ -356,6 +397,7 @@ impl Channel for WuKongIMChannel {
                     last_activity = Instant::now();
                     
                     if let WsMsg::Text(text) = msg {
+                        tracing::trace!("WuKongIM: incoming raw text: {}", text);
                         let val: serde_json::Value = serde_json::from_str(&text)?;
 
                         // Handle pong (server responds with {"method": "pong"}, no id)
@@ -365,11 +407,24 @@ impl Channel for WuKongIMChannel {
                         }
 
                         // Handle Response (matched by id)
-                        if let Some(id) = val.get("id").and_then(|i| i.as_str()) {
+                        let msg_id = val.get("id").and_then(|i| {
+                            if i.is_string() {
+                                i.as_str().map(|s| s.to_string())
+                            } else if i.is_number() {
+                                Some(i.to_string())
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some(id) = msg_id {
                             let mut pending = self.pending_responses.write().await;
-                            if let Some(resp_tx) = pending.remove(id) {
+                            if let Some(resp_tx) = pending.remove(&id) {
+                                tracing::debug!("WuKongIM: matched RPC response for id {}", id);
                                 let _ = resp_tx.send(val);
                                 continue;
+                            } else {
+                                tracing::debug!("WuKongIM: received response with id {} but no pending request found", id);
                             }
                         }
 
@@ -384,11 +439,24 @@ impl Channel for WuKongIMChannel {
                                     continue;
                                 }
 
+                                // 1. Decode Base64 payload
+                                let decoded_payload = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
+                                let payload_json: serde_json::Value = serde_json::from_slice(&decoded_payload)?;
+
+                                // 2. Filter out system commands (type 99 or presence of 'cmd')
+                                let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+                                if msg_type == 99 || payload_json.get("cmd").is_some() {
+                                    tracing::trace!("WuKongIM: skipping system message or internal command");
+                                    // Still Ack to stop server retries
+                                    let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+                                    continue;
+                                }
+
                                 // Handle type 20 interactive response
-                                if let Some(msg_type) = params.payload.get("type").and_then(|t| t.as_u64()) {
+                                if let Some(msg_type) = payload_json.get("type").and_then(|t| t.as_u64()) {
                                     if msg_type == 20 {
-                                        if let Some(approval_id) = params.payload.get("approval_id").and_then(|id| id.as_str()) {
-                                            if let Some(action) = params.payload.get("action").and_then(|a| a.as_str()) {
+                                        if let Some(approval_id) = payload_json.get("approval_id").and_then(|id| id.as_str()) {
+                                            if let Some(action) = payload_json.get("action").and_then(|a| a.as_str()) {
                                                 let response = match action {
                                                     "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
                                                     "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
@@ -411,16 +479,22 @@ impl Channel for WuKongIMChannel {
                                 let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
                                 // Extract text content
-                                let content = if let Some(content) = params.payload.get("content").and_then(|c| c.as_str()) {
-                                    content.to_string()
+                                let content = payload_json.get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or(&params.payload)
+                                    .to_string();
+
+                                // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
+                                let target_id = if params.channel_type == 1 {
+                                    &params.from_uid
                                 } else {
-                                    params.payload.to_string()
+                                    &params.channel_id
                                 };
 
                                 let channel_msg = ChannelMessage {
                                     id: params.message_id,
                                     sender: params.from_uid.clone(),
-                                    reply_target: params.from_uid,
+                                    reply_target: format!("{}:{}", params.channel_type, target_id),
                                     content,
                                     channel: "wukongim".to_string(),
                                     timestamp: params.timestamp as u64,
@@ -458,12 +532,21 @@ impl Channel for WuKongIMChannel {
         
         let card = self.build_approval_card(&approval_id, request, timeout_secs);
 
+        let payload_json = serde_json::to_string(&card)?;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload_json);
+
         let params = SendParams {
-            header: Header::default(),
+            from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
             channel_id: recipient.to_string(),
             channel_type: 1, // Person
-            payload: card,
+            payload: payload_b64,
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
         };
 
         let (tx, rx) = tokio::sync::oneshot::channel();
