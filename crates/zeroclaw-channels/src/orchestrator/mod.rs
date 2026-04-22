@@ -6115,7 +6115,11 @@ mod tests {
         ];
 
         let normalized = normalize_cached_channel_turns(turns);
-        assert_eq!(normalized.len(), 4, "tool_calls assistant must not be merged");
+        assert_eq!(
+            normalized.len(),
+            4,
+            "tool_calls assistant must not be merged"
+        );
         assert_eq!(normalized[1].role, "assistant");
         assert_eq!(normalized[1].content, "已记下，下次再试");
         assert_eq!(normalized[2].role, "assistant");

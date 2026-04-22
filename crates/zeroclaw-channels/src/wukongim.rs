@@ -122,7 +122,6 @@ pub struct RecvAckParams {
     pub message_seq: u32,
 }
 
-
 #[derive(Clone)]
 pub struct WuKongIMChannel {
     ws_url: String,
@@ -131,12 +130,31 @@ pub struct WuKongIMChannel {
     device_id: String,
     allowed_users: Vec<String>,
     /// Pending responses: id -> tx
-    pending_responses: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    pending_responses:
+        Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     /// Pending approvals: id -> tx
-    pending_approvals: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<
+        RwLock<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+            >,
+        >,
+    >,
     approval_timeout_secs: u64,
     /// Outbound WS sink
-    ws_sink: Arc<RwLock<Option<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, WsMsg>>>>,
+    ws_sink: Arc<
+        RwLock<
+            Option<
+                futures_util::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                    WsMsg,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl WuKongIMChannel {
@@ -200,11 +218,17 @@ impl WuKongIMChannel {
         let resp: JsonRpcResponse<R> = serde_json::from_value(resp_val)?;
 
         if let Some(err) = resp.error {
-            tracing::error!("WuKongIM RPC error ({}): {} (code {})", method, err.message, err.code);
+            tracing::error!(
+                "WuKongIM RPC error ({}): {} (code {})",
+                method,
+                err.message,
+                err.code
+            );
             anyhow::bail!("WuKongIM RPC error: {} (code {})", err.message, err.code);
         }
 
-        resp.result.ok_or_else(|| anyhow::anyhow!("WuKongIM RPC: missing result"))
+        resp.result
+            .ok_or_else(|| anyhow::anyhow!("WuKongIM RPC: missing result"))
     }
 
     async fn send_ack(&self, message_id: String, message_seq: u32) -> anyhow::Result<()> {
@@ -280,7 +304,11 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        tracing::debug!("WuKongIM: sending message to {}: {}", message.recipient, message.content);
+        tracing::debug!(
+            "WuKongIM: sending message to {}: {}",
+            message.recipient,
+            message.content
+        );
         let payload_obj = serde_json::json!({
             "type": 1,
             "content": message.content,
@@ -323,7 +351,7 @@ impl Channel for WuKongIMChannel {
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
         let (write, mut read) = ws_stream.split();
-        
+
         {
             let mut sink_guard = self.ws_sink.write().await;
             *sink_guard = Some(write);
@@ -395,7 +423,7 @@ impl Channel for WuKongIMChannel {
                 msg = read.next() => {
                     let msg = msg.ok_or_else(|| anyhow::anyhow!("WuKongIM: stream closed"))??;
                     last_activity = Instant::now();
-                    
+
                     if let WsMsg::Text(text) = msg {
                         tracing::trace!("WuKongIM: incoming raw text: {}", text);
                         let val: serde_json::Value = serde_json::from_str(&text)?;
@@ -433,7 +461,7 @@ impl Channel for WuKongIMChannel {
                             if method == "recv" {
                                 let notification: JsonRpcNotification<RecvNotificationParams> = serde_json::from_value(val)?;
                                 let params = notification.params;
-                                
+
                                 if !self.is_user_allowed(&params.from_uid) {
                                     tracing::warn!("WuKongIM: ignoring message from {} (unauthorized)", params.from_uid);
                                     continue;
@@ -474,7 +502,7 @@ impl Channel for WuKongIMChannel {
                                         }
                                     }
                                 }
-                                
+
                                 // Ack receipt
                                 let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
@@ -512,13 +540,16 @@ impl Channel for WuKongIMChannel {
                 }
             }
         }
-        
+
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
         // Basic connectivity check: attempt a TCP connection to the WS endpoint.
-        let url = self.ws_url.trim_start_matches("ws://").trim_start_matches("wss://");
+        let url = self
+            .ws_url
+            .trim_start_matches("ws://")
+            .trim_start_matches("wss://");
         tokio::net::TcpStream::connect(url).await.is_ok()
     }
 
@@ -529,7 +560,7 @@ impl Channel for WuKongIMChannel {
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
         let timeout_secs = self.approval_timeout_secs;
-        
+
         let card = self.build_approval_card(&approval_id, request, timeout_secs);
 
         let payload_json = serde_json::to_string(&card)?;
@@ -556,7 +587,8 @@ impl Channel for WuKongIMChannel {
         }
 
         // Send card
-        self.send_rpc::<_, serde_json::Value>("send", params).await?;
+        self.send_rpc::<_, serde_json::Value>("send", params)
+            .await?;
 
         // Wait for response with timeout
         match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
