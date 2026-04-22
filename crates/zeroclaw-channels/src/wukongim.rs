@@ -122,6 +122,11 @@ pub struct RecvAckParams {
     pub message_seq: u32,
 }
 
+type WsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    WsMsg,
+>;
+
 #[derive(Clone)]
 pub struct WuKongIMChannel {
     ws_url: String,
@@ -143,18 +148,7 @@ pub struct WuKongIMChannel {
     >,
     approval_timeout_secs: u64,
     /// Outbound WS sink
-    ws_sink: Arc<
-        RwLock<
-            Option<
-                futures_util::stream::SplitSink<
-                    tokio_tungstenite::WebSocketStream<
-                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                    >,
-                    WsMsg,
-                >,
-            >,
-        >,
-    >,
+    ws_sink: Arc<RwLock<Option<WsSink>>>,
 }
 
 impl WuKongIMChannel {
@@ -163,7 +157,7 @@ impl WuKongIMChannel {
             ws_url: config.ws_url.clone(),
             uid: config.uid.clone(),
             token: config.token.clone(),
-            device_id: format!("zeroclaw-{}", Uuid::new_v4().to_string()[..8].to_string()),
+            device_id: format!("zeroclaw-{}", &Uuid::new_v4().to_string()[..8]),
             allowed_users: config.allowed_users.clone(),
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -456,84 +450,87 @@ impl Channel for WuKongIMChannel {
                             }
                         }
 
-                                // Handle Notification
-                        if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
-                            if method == "recv" {
-                                let notification: JsonRpcNotification<RecvNotificationParams> = serde_json::from_value(val)?;
-                                let params = notification.params;
+                        // Handle Notification
+                        if let Some("recv") = val.get("method").and_then(|m| m.as_str()) {
+                            let notification: JsonRpcNotification<RecvNotificationParams> =
+                                serde_json::from_value(val)?;
+                            let params = notification.params;
 
-                                if !self.is_user_allowed(&params.from_uid) {
-                                    tracing::warn!("WuKongIM: ignoring message from {} (unauthorized)", params.from_uid);
-                                    continue;
-                                }
+                            if !self.is_user_allowed(&params.from_uid) {
+                                tracing::warn!("WuKongIM: ignoring message from {} (unauthorized)", params.from_uid);
+                                continue;
+                            }
 
-                                // 1. Decode Base64 payload
-                                let decoded_payload = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
-                                let payload_json: serde_json::Value = serde_json::from_slice(&decoded_payload)?;
+                            // 1. Decode Base64 payload
+                            let decoded_payload = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
+                            let payload_json: serde_json::Value = serde_json::from_slice(&decoded_payload)?;
 
-                                // 2. Filter out system commands (type 99 or presence of 'cmd')
-                                let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
-                                if msg_type == 99 || payload_json.get("cmd").is_some() {
-                                    tracing::trace!("WuKongIM: skipping system message or internal command");
-                                    // Still Ack to stop server retries
-                                    let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-                                    continue;
-                                }
+                            // 2. Filter out system commands (type 99 or presence of 'cmd')
+                            let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+                            if msg_type == 99 || payload_json.get("cmd").is_some() {
+                                tracing::trace!("WuKongIM: skipping system message or internal command");
+                                // Still Ack to stop server retries
+                                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+                                continue;
+                            }
 
-                                // Handle type 20 interactive response
-                                if let Some(msg_type) = payload_json.get("type").and_then(|t| t.as_u64()) {
-                                    if msg_type == 20 {
-                                        if let Some(approval_id) = payload_json.get("approval_id").and_then(|id| id.as_str()) {
-                                            if let Some(action) = payload_json.get("action").and_then(|a| a.as_str()) {
-                                                let response = match action {
-                                                    "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
-                                                    "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
-                                                    "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
-                                                    _ => None,
-                                                };
-                                                if let Some(resp) = response {
-                                                    let mut pending = self.pending_approvals.write().await;
-                                                    if let Some(tx) = pending.remove(approval_id) {
-                                                        let _ = tx.send(resp);
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
+                            // Handle type 20 interactive response
+                            if let (Some(20), Some(approval_id), Some(action)) = (
+                                payload_json.get("type").and_then(|t| t.as_u64()),
+                                payload_json.get("approval_id").and_then(|id| id.as_str()),
+                                payload_json.get("action").and_then(|a| a.as_str()),
+                            ) {
+                                let response = match action {
+                                    "approve" => {
+                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+                                    }
+                                    "deny" => {
+                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
+                                    }
+                                    "always" => Some(
+                                        zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+                                    ),
+                                    _ => None,
+                                };
+                                if let Some(resp) = response {
+                                    let mut pending = self.pending_approvals.write().await;
+                                    if let Some(tx) = pending.remove(approval_id) {
+                                        let _ = tx.send(resp);
+                                        continue;
                                     }
                                 }
+                            }
 
-                                // Ack receipt
-                                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+                            // Ack receipt
+                            let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
-                                // Extract text content
-                                let content = payload_json.get("content")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or(&params.payload)
-                                    .to_string();
+                            // Extract text content
+                            let content = payload_json.get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or(&params.payload)
+                                .to_string();
 
-                                // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
-                                let target_id = if params.channel_type == 1 {
-                                    &params.from_uid
-                                } else {
-                                    &params.channel_id
-                                };
+                            // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
+                            let target_id = if params.channel_type == 1 {
+                                &params.from_uid
+                            } else {
+                                &params.channel_id
+                            };
 
-                                let channel_msg = ChannelMessage {
-                                    id: params.message_id,
-                                    sender: params.from_uid.clone(),
-                                    reply_target: format!("{}:{}", params.channel_type, target_id),
-                                    content,
-                                    channel: "wukongim".to_string(),
-                                    timestamp: params.timestamp as u64,
-                                    thread_ts: None,
-                                    interruption_scope_id: None,
-                                    attachments: vec![],
-                                };
+                            let channel_msg = ChannelMessage {
+                                id: params.message_id,
+                                sender: params.from_uid.clone(),
+                                reply_target: format!("{}:{}", params.channel_type, target_id),
+                                content,
+                                channel: "wukongim".to_string(),
+                                timestamp: params.timestamp as u64,
+                                thread_ts: None,
+                                interruption_scope_id: None,
+                                attachments: vec![],
+                            };
 
-                                if tx.send(channel_msg).await.is_err() {
-                                    break;
-                                }
+                            if tx.send(channel_msg).await.is_err() {
+                                break;
                             }
                         }
                     }

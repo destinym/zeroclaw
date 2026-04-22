@@ -11776,6 +11776,7 @@ auto_save = true
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
+                wukongim: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -12912,6 +12913,7 @@ allowed_rooms = ["!ops:matrix.org"]
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            wukongim: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -13286,6 +13288,7 @@ bot_token = "xoxb-tok"
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            wukongim: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
